@@ -1,0 +1,131 @@
+# ============================================================================
+# Vivero de microgreens automatizado — riego por humedad de suelo
+# Placa: ESP32 (DevKitC / genérica)
+# Sensor: higrómetro capacitivo de suelo -> pin analógico (ADC)
+# Actuador: relé 5V -> mini bomba de agua sumergible
+# ============================================================================
+
+esphome:
+  name: microgreens-vivero
+  friendly_name: Vivero Microgreens
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ----------------------------------------------------------------------------
+# Wi-Fi + API de Home Assistant + OTA
+# Si el ESP32 pierde la conexión Wi-Fi, sigue ejecutando localmente el
+# automatismo de riego definido más abajo (no depende de Home Assistant).
+# ----------------------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "Microgreens Fallback"
+    password: !secret ap_fallback_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+
+# ----------------------------------------------------------------------------
+# 1) CONFIGURACIÓN BASE DE PINES
+# ----------------------------------------------------------------------------
+
+# Umbral de humedad (en % ya calibrado) por debajo del cual se activa el riego.
+# Ajusta este valor según la calibración de tu sensor en el sustrato real.
+substitutions:
+  humedad_umbral: "35.0"          # % de humedad por debajo del cual se riega
+  duracion_riego_seg: "10s"       # tiempo que la bomba permanece encendida
+
+sensor:
+  - platform: adc
+    pin: GPIO34                    # pin analógico (input-only) del ESP32
+    name: "Humedad de Suelo"
+    id: humedad_suelo
+    update_interval: 10s
+    attenuation: 11db              # permite leer todo el rango 0-3.3V
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+
+    # --------------------------------------------------------------------
+    # 2) FILTROS: promedian las lecturas y limpian el ruido del sensor
+    # --------------------------------------------------------------------
+    filters:
+      # a) Convierte el voltaje crudo (0.0–3.3V) a un porcentaje 0–100%.
+      #    Los valores "from"/"to" deben calibrarse con tu sensor:
+      #    - Sensor al aire (seco)  -> voltaje más alto (ej. 2.8V = 0%)
+      #    - Sensor en agua (húmedo) -> voltaje más bajo (ej. 1.2V = 100%)
+      - calibrate_linear:
+          - 2.8 -> 0.0
+          - 1.2 -> 100.0
+
+      # b) Media móvil: promedia las últimas N lecturas para eliminar
+      #    picos/ruido puntual de la señal analógica (interferencia,
+      #    micro-vibraciones, etc.). Con update_interval de 10s y
+      #    window_size 6, se obtiene un promedio suavizado cada ~60s.
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+
+      # c) Limita el resultado a un rango físicamente posible (0-100%),
+      #    por si la calibración lineal se sale de rango.
+      - clamp:
+          min_value: 0.0
+          max_value: 100.0
+
+    # --------------------------------------------------------------------
+    # 3) AUTOMATIZACIÓN LOCAL DE RIEGO (vive por completo dentro del ESP32)
+    #
+    # Lógica:
+    #   - "on_value" dispara este bloque cada vez que el sensor entrega una
+    #     nueva lectura, YA FILTRADA (paso 2 de arriba).
+    #   - Si la humedad cae por debajo del umbral, se ejecuta un "script".
+    #   - El script enciende el relé, espera la duración configurada y
+    #     apaga el relé. Al declararse "mode: single", si el script ya
+    #     está corriendo (bomba regando), una nueva lectura baja no lo
+    #     reinicia ni lo solapa: evita que la bomba quede encendida de
+    #     forma continua o se dispare varias veces seguidas.
+    #
+    # Como todo esto corre en el firmware del ESP32 (sensor -> lambda ->
+    # script -> switch), el riego de emergencia sigue funcionando aunque
+    # el ESP32 pierda la conexión Wi-Fi o Home Assistant esté caído,
+    # evitando que las plantas se sequen por falta de conectividad.
+    # --------------------------------------------------------------------
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x < ${humedad_umbral};'
+            then:
+              - script.execute: ciclo_riego
+
+# ----------------------------------------------------------------------------
+# Relé para la mini bomba de agua
+# ----------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    pin: GPIO26
+    id: rele_bomba
+    name: "Bomba de Riego"
+    restore_mode: ALWAYS_OFF        # al reiniciar, la bomba nunca queda encendida
+
+script:
+  - id: ciclo_riego
+    mode: single
+    then:
+      - logger.log: "Humedad baja detectada: activando riego local"
+      - switch.turn_on: rele_bomba
+      - delay: ${duracion_riego_seg}
+      - switch.turn_off: rele_bomba
