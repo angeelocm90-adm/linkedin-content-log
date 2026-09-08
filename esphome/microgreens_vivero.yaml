@@ -70,9 +70,42 @@ sensor:
           condition:
             sensor.in_range:
               id: humedad_sustrato
-              below: ${umbral_humedad}
+              below: !lambda "return id(umbral_humedad_numero).state;"
           then:
             - script.execute: regar_planta
+
+# --- Nivel de agua del tanque (interruptor de flotador digital) ---
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+        pullup: true
+    id: agua_baja
+    name: "Nivel de Agua Bajo"
+    device_class: problem
+    # Asume flotador normalmente abierto que cierra a GND al bajar el nivel
+    # (pin en LOW = tanque bajo). Ajusta "inverted" según tu sensor/cableado.
+    inverted: true
+    filters:
+      # Debounce: ignora rebotes mecánicos del flotador al moverse con el agua.
+      - delayed_on: 500ms
+      - delayed_off: 500ms
+
+# --- Umbral de humedad editable desde Home Assistant ---
+number:
+  - platform: template
+    name: "Umbral de Riego"
+    id: umbral_humedad_numero
+    icon: "mdi:water-percent"
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 80
+    step: 1
+    initial_value: ${umbral_humedad}
+    optimistic: true
+    restore_value: true   # conserva el valor ajustado en HA aunque se reinicie el ESP32
 
 # --- Relé de 5V que alimenta la mini bomba ---
 switch:
@@ -85,13 +118,19 @@ switch:
     # inverted: true
     restore_mode: ALWAYS_OFF
 
-# --- Script de riego: evita solapamientos si ya está regando ---
+# --- Script de riego: evita solapamientos y no riega si falta agua ---
 script:
   - id: regar_planta
     mode: single
     then:
-      - logger.log: "Humedad baja detectada: activando riego de emergencia"
-      - switch.turn_on: rele_bomba
-      - delay: ${duracion_riego}
-      - switch.turn_off: rele_bomba
-      - logger.log: "Ciclo de riego finalizado"
+      - if:
+          condition:
+            binary_sensor.is_off: agua_baja
+          then:
+            - logger.log: "Humedad baja detectada: activando riego de emergencia"
+            - switch.turn_on: rele_bomba
+            - delay: ${duracion_riego}
+            - switch.turn_off: rele_bomba
+            - logger.log: "Ciclo de riego finalizado"
+          else:
+            - logger.log: "Riego cancelado: nivel de agua del tanque bajo"
